@@ -42,6 +42,18 @@
 
 using namespace std;
 
+static void replaceDelimitersWithSpaces(string &inputString,
+                                        const string &delimiters) {
+  for (unsigned t = 0; t < inputString.size(); t++) {
+    for (unsigned d = 0; d < delimiters.size(); d++) {
+      if (inputString[t] == delimiters.at(d)) {
+        inputString[t] = ' ';
+        break;
+      }
+    }
+  }
+}
+
 // A generic option registry regardless of data type
 class OptionRegistryInterface {
  public:
@@ -122,6 +134,8 @@ bool OptionRegistry<string>::fromString(const string str) {
 // specialized parser for c-string type options
 template <>
 bool OptionRegistry<char *>::fromString(const string str) {
+  // Preserve legacy ownership: parsed overrides allocate storage and publish
+  // the raw pointer through the caller-owned variable.
   m_variable = new char[str.size() + 1];
   strcpy(m_variable, str.c_str());
   m_isParsed = true;
@@ -131,6 +145,8 @@ bool OptionRegistry<char *>::fromString(const string str) {
 // specialized default assignment for c-string type option to allow NULL default
 template <>
 bool OptionRegistry<char *>::assignDefault(const char *str) {
+  // Defaults are borrowed pointers, including NULL; callers historically see
+  // the default pointer value directly.
   m_variable = const_cast<char *>(
       str);  // c-string options are not meant to be edited anyway
   m_isParsed = true;
@@ -149,7 +165,8 @@ string OptionRegistry<char *>::toString() {
   return ss.str();
 }
 
-// specialized parser for boolean options
+// specialized parser for boolean options. An empty or non-numeric value keeps
+// the implicit true flag value while reporting that no value token was parsed.
 template <>
 bool OptionRegistry<bool>::fromString(const string str) {
   int value = 1;
@@ -194,6 +211,8 @@ class OptionParser {
     OptionRegistry<T> *p_option =
         new OptionRegistry<T>(optionName, optionDesc, optionVariable);
     m_optionReg.push_back(p_option);
+    // Preserve duplicate-name behavior: printing keeps every registration in
+    // order, while parsing targets the most recent map entry.
     m_optionMap[optionName] = p_option;
     p_option->assignDefault(optionDefault);
   }
@@ -271,14 +290,7 @@ class OptionParser {
   // parse the given string as tokens separated by a set of given delimiters
   void ParseString(string inputString, const string delimiters = string(" ;")) {
     // convert all delimiter characters into whitespaces
-    for (unsigned t = 0; t < inputString.size(); t++) {
-      for (unsigned d = 0; d < delimiters.size(); d++) {
-        if (inputString[t] == delimiters.at(d)) {
-          inputString[t] = ' ';
-          break;
-        }
-      }
-    }
+    replaceDelimitersWithSpaces(inputString, delimiters);
     stringstream args(inputString);
     ParseStringStream(args);
   }
@@ -297,6 +309,8 @@ class OptionParser {
       if (argNew.size() == 0) continue;  // this is probably the last token
 
       if (argNew[0] == '"') {
+        // Quoted values are coalesced after delimiter/comment handling, so
+        // preserve this mini-language before extracting tokenization.
         while (args.good() && argNew[argNew.size() - 1] != '"') {
           string argCont;
           args >> argCont;
@@ -331,6 +345,8 @@ class OptionParser {
              << (*i_option)->GetName() << "'\n";
         assert(0);
       }
+      // Required options are represented by defaults that fail to parse; the
+      // legacy parser reports them during printing.
       sout << setw(20) << left << (*i_option)->GetName() << " ";
       sout << setw(20) << right << (*i_option)->toString() << " # ";
       sout << left << (*i_option)->GetDesc();

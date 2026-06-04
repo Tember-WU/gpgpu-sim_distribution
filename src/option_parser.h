@@ -44,6 +44,8 @@ enum option_dtype {
   OPT_FLOAT,
   OPT_DOUBLE,
   OPT_CHAR,
+  // Legacy C-string options assign default pointers directly, but parsed
+  // overrides allocate new storage. Keep that ownership contract stable.
   OPT_CSTR
 };
 
@@ -56,15 +58,17 @@ void option_parser_register(option_parser_t opp, const char *name,
                             enum option_dtype type, void *variable,
                             const char *desc, const char *defaultvalue);
 
-// parse command line
+// parse command line. The legacy API reports parse failures by printing and
+// exiting rather than returning an error code.
 void option_parser_cmdline(option_parser_t opp, int argc, const char *argv[]);
 
-// parse config file
+// parse config file. Uses the same fatal-error behavior as command-line
+// parsing for compatibility with simulator startup.
 void option_parser_cfgfile(option_parser_t opp, const char *filename);
 
 // parse a delimited string
 void option_parser_delimited_string(option_parser_t opp,
                                     const char *inputstring,
                                     const char *delimiters);
-// print options
+// print options. Printing also validates that required options were parsed.
 void option_parser_print(option_parser_t opp, FILE *fout);
