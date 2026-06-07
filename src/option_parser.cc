@@ -42,6 +42,12 @@
 
 using namespace std;
 
+static char *copy_to_c_string(const string &value) {
+  char *copy = new char[value.size() + 1];
+  strcpy(copy, value.c_str());
+  return copy;
+}
+
 // A generic option registry regardless of data type
 class OptionRegistryInterface {
  public:
@@ -122,8 +128,7 @@ bool OptionRegistry<string>::fromString(const string str) {
 // specialized parser for c-string type options
 template <>
 bool OptionRegistry<char *>::fromString(const string str) {
-  m_variable = new char[str.size() + 1];
-  strcpy(m_variable, str.c_str());
+  m_variable = copy_to_c_string(str);
   m_isParsed = true;
   return true;
 }
@@ -293,8 +298,7 @@ class OptionParser {
   void ParseStringStream(stringstream &args) {
     // extract non-whitespace string tokens
     vector<char *> argv;
-    argv.push_back(new char[6]);
-    strcpy(argv[0], "dummy");
+    argv.push_back(copy_to_c_string("dummy"));
     while (args.good()) {
       string argNew;
       args >> argNew;
@@ -311,9 +315,7 @@ class OptionParser {
         argNew.erase(argNew.size() - 1);
       }
 
-      char *c_argNew = new char[argNew.size() + 1];
-      strcpy(c_argNew, argNew.c_str());
-      argv.push_back(c_argNew);
+      argv.push_back(copy_to_c_string(argNew));
     }
 
     // pass the string token into normal commandline parser
