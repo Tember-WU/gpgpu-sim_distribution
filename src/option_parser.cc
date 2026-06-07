@@ -208,7 +208,7 @@ class OptionParser {
         const char *argstr = (i + 1 < argc) ? argv[i + 1] : "";
         OptionRegistryInterface *p_option = i_option->second;
         if (p_option->isFlag()) {
-          if (p_option->fromString(argstr) == true) {
+          if (ParseFlagOption(p_option, argstr) == true) {
             i += 1;
           }
         } else {
@@ -240,6 +240,11 @@ class OptionParser {
         exit(1);
       }
     }
+  }
+
+  bool ParseFlagOption(OptionRegistryInterface *p_option,
+                       const char *next_arg) {
+    return p_option->fromString(next_arg);
   }
 
   void ParseFile(const char *filename) {
