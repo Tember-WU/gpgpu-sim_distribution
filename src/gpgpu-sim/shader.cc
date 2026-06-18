@@ -56,6 +56,65 @@
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
+namespace {
+
+unsigned long long shader_cycle_now(const gpgpu_sim *gpu) {
+  return gpu->gpu_tot_sim_cycle + gpu->gpu_sim_cycle;
+}
+
+unsigned active_lanes_for_regfile_gating(const active_mask_t &active_mask,
+                                         const shader_core_config *config) {
+  unsigned active_count = 0;
+  for (unsigned i = 0; i < config->warp_size;
+       i = i + config->n_regfile_gating_group) {
+    for (unsigned j = 0; j < config->n_regfile_gating_group; j++) {
+      if (active_mask.test(i + j)) {
+        active_count += config->n_regfile_gating_group;
+        break;
+      }
+    }
+  }
+  return active_count;
+}
+
+unsigned outgoing_packet_size(const mem_fetch *mf) {
+  if (!mf->get_is_write() && !mf->isatomic()) {
+    return mf->get_ctrl_size();
+  }
+  return mf->size();
+}
+
+unsigned incoming_packet_size(const mem_fetch *mf) {
+  return mf->get_is_write() ? mf->get_ctrl_size() : mf->size();
+}
+
+bool should_bypass_l1d(const warp_inst_t &inst, bool has_l1d,
+                       bool skip_global_l1d) {
+  if (CACHE_GLOBAL == inst.cache_op || !has_l1d) return true;
+  if (inst.space.is_global()) {
+    return skip_global_l1d && (CACHE_L1 != inst.cache_op);
+  }
+  return false;
+}
+
+bool should_bypass_l1d(mem_fetch *mf, bool has_l1d,
+                       bool skip_global_l1d) {
+  if (CACHE_GLOBAL == mf->get_inst().cache_op || !has_l1d) return true;
+  if (mf->get_access_type() == GLOBAL_ACC_R ||
+      mf->get_access_type() == GLOBAL_ACC_W) {
+    return skip_global_l1d;
+  }
+  return false;
+}
+
+unsigned checked_active_lanes_in_pipeline(unsigned active_count,
+                                          const shader_core_config *config) {
+  assert(active_count <= config->warp_size);
+  return active_count;
+}
+
+}  // namespace
+
 mem_fetch *shader_core_mem_fetch_allocator::alloc(
     new_addr_type addr, mem_access_type type, unsigned size, bool wr,
     unsigned long long cycle, unsigned long long streamID) const {
@@ -992,7 +1051,7 @@ void shader_core_ctx::fetch() {
           mem_fetch *mf = new mem_fetch(
               acc, NULL, m_warp[warp_id]->get_streamID(), READ_PACKET_SIZE,
               warp_id, m_sid, m_tpc, m_memory_config,
-              m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+              shader_cycle_now(m_gpu));
           std::list<cache_event> events;
           enum cache_request_status status;
           if (m_config->perfect_inst_const_cache) {
@@ -1001,7 +1060,7 @@ void shader_core_ctx::fetch() {
           } else
             status = m_L1I->access(
                 (new_addr_type)ppc, mf,
-                m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle, events);
+                shader_cycle_now(m_gpu), events);
 
           if (status == MISS) {
             m_last_warp_fetched = warp_id;
@@ -1046,7 +1105,7 @@ void shader_core_ctx::issue_warp(register_set &pipe_reg_set,
   assert(next_inst->valid());
   **pipe_reg = *next_inst;  // static instruction information
   (*pipe_reg)->issue(
-      active_mask, warp_id, m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle,
+      active_mask, warp_id, shader_cycle_now(m_gpu),
       m_warp[warp_id]->get_dynamic_warp_id(), sch_id,
       m_warp[warp_id]->get_streamID());  // dynamic instruction information
   m_stats->shader_cycle_distro[2 + (*pipe_reg)->active_count()]++;
@@ -1925,7 +1984,7 @@ void shader_core_ctx::warp_inst_complete(const warp_inst_t &inst) {
 
   m_stats->m_num_sim_winsn[m_sid]++;
   m_gpu->gpu_sim_insn += inst.active_count();
-  inst.completed(m_gpu->gpu_tot_sim_cycle + m_gpu->gpu_sim_cycle);
+  inst.completed(shader_cycle_now(m_gpu));
 }
 
 void shader_core_ctx::writeback() {
@@ -2051,11 +2110,11 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue(cache_t *cache,
   // const mem_access_t &access = inst.accessq_back();
   mem_fetch *mf = m_mf_allocator->alloc(
       inst, inst.accessq_back(),
-      m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle);
+      shader_cycle_now(m_core->get_gpu()));
   std::list<cache_event> events;
   enum cache_request_status status = cache->access(
       mf->get_addr(), mf,
-      m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle,
+      shader_cycle_now(m_core->get_gpu()),
       events);
   return process_cache_access(cache, mf->get_addr(), inst, events, mf, status);
 }
@@ -2112,7 +2171,7 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
     std::list<cache_event> events;
     enum cache_request_status status = cache->access(
         mf->get_addr(), mf,
-        m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle,
+        shader_cycle_now(m_core->get_gpu()),
         events);
     return process_cache_access(cache, mf->get_addr(), inst, events, mf,
                                 status);
@@ -2269,16 +2328,8 @@ bool ldst_unit::memory_cycle(warp_inst_t &inst,
   if (inst.accessq_empty()) return true;
 
   mem_stage_stall_type stall_cond = NO_RC_FAIL;
-  const mem_access_t &access = inst.accessq_back();
-
-  bool bypassL1D = false;
-  if (CACHE_GLOBAL == inst.cache_op || (m_L1D == NULL)) {
-    bypassL1D = true;
-  } else if (inst.space.is_global()) {  // global memory access
-    // skip L1 cache if the option is enabled
-    if (m_core->get_config()->gmem_skip_L1D && (CACHE_L1 != inst.cache_op))
-      bypassL1D = true;
-  }
+  bool bypassL1D = should_bypass_l1d(
+      inst, m_L1D != NULL, m_core->get_config()->gmem_skip_L1D);
   if (bypassL1D) {
     // bypass L1 cache
     unsigned control_size =
@@ -2342,7 +2393,7 @@ bool ldst_unit::response_buffer_full() const {
 void ldst_unit::fill(mem_fetch *mf) {
   mf->set_status(
       IN_SHADER_LDST_RESPONSE_FIFO,
-      m_core->get_gpu()->gpu_sim_cycle + m_core->get_gpu()->gpu_tot_sim_cycle);
+      shader_cycle_now(m_core->get_gpu()));
   m_response_fifo.push_back(mf);
 }
 
@@ -2417,51 +2468,51 @@ unsigned pipelined_simd_unit::get_active_lanes_in_pipeline() {
 }
 
 void ldst_unit::active_lanes_in_pipeline() {
-  unsigned active_count = pipelined_simd_unit::get_active_lanes_in_pipeline();
-  assert(active_count <= m_core->get_config()->warp_size);
+  unsigned active_count = checked_active_lanes_in_pipeline(
+      get_active_lanes_in_pipeline(), m_core->get_config());
   m_core->incfumemactivelanes_stat(active_count);
 }
 
 void sp_unit::active_lanes_in_pipeline() {
-  unsigned active_count = pipelined_simd_unit::get_active_lanes_in_pipeline();
-  assert(active_count <= m_core->get_config()->warp_size);
+  unsigned active_count = checked_active_lanes_in_pipeline(
+      get_active_lanes_in_pipeline(), m_core->get_config());
   m_core->incspactivelanes_stat(active_count);
   m_core->incfuactivelanes_stat(active_count);
   m_core->incfumemactivelanes_stat(active_count);
 }
 void dp_unit::active_lanes_in_pipeline() {
-  unsigned active_count = pipelined_simd_unit::get_active_lanes_in_pipeline();
-  assert(active_count <= m_core->get_config()->warp_size);
+  unsigned active_count = checked_active_lanes_in_pipeline(
+      get_active_lanes_in_pipeline(), m_core->get_config());
   // m_core->incspactivelanes_stat(active_count);
   m_core->incfuactivelanes_stat(active_count);
   m_core->incfumemactivelanes_stat(active_count);
 }
 void specialized_unit::active_lanes_in_pipeline() {
-  unsigned active_count = pipelined_simd_unit::get_active_lanes_in_pipeline();
-  assert(active_count <= m_core->get_config()->warp_size);
+  unsigned active_count = checked_active_lanes_in_pipeline(
+      get_active_lanes_in_pipeline(), m_core->get_config());
   m_core->incspactivelanes_stat(active_count);
   m_core->incfuactivelanes_stat(active_count);
   m_core->incfumemactivelanes_stat(active_count);
 }
 
 void int_unit::active_lanes_in_pipeline() {
-  unsigned active_count = pipelined_simd_unit::get_active_lanes_in_pipeline();
-  assert(active_count <= m_core->get_config()->warp_size);
+  unsigned active_count = checked_active_lanes_in_pipeline(
+      get_active_lanes_in_pipeline(), m_core->get_config());
   m_core->incspactivelanes_stat(active_count);
   m_core->incfuactivelanes_stat(active_count);
   m_core->incfumemactivelanes_stat(active_count);
 }
 void sfu::active_lanes_in_pipeline() {
-  unsigned active_count = pipelined_simd_unit::get_active_lanes_in_pipeline();
-  assert(active_count <= m_core->get_config()->warp_size);
+  unsigned active_count = checked_active_lanes_in_pipeline(
+      get_active_lanes_in_pipeline(), m_core->get_config());
   m_core->incsfuactivelanes_stat(active_count);
   m_core->incfuactivelanes_stat(active_count);
   m_core->incfumemactivelanes_stat(active_count);
 }
 
 void tensor_core::active_lanes_in_pipeline() {
-  unsigned active_count = pipelined_simd_unit::get_active_lanes_in_pipeline();
-  assert(active_count <= m_core->get_config()->warp_size);
+  unsigned active_count = checked_active_lanes_in_pipeline(
+      get_active_lanes_in_pipeline(), m_core->get_config());
   m_core->incsfuactivelanes_stat(active_count);
   m_core->incfuactivelanes_stat(active_count);
   m_core->incfumemactivelanes_stat(active_count);
@@ -2877,14 +2928,8 @@ void ldst_unit::cycle() {
         assert(!mf->get_is_write());  // L1 cache is write evict, allocate line
                                       // on load miss only
 
-        bool bypassL1D = false;
-        if (CACHE_GLOBAL == mf->get_inst().cache_op || (m_L1D == NULL)) {
-          bypassL1D = true;
-        } else if (mf->get_access_type() == GLOBAL_ACC_R ||
-                   mf->get_access_type() ==
-                       GLOBAL_ACC_W) {  // global memory access
-          if (m_core->get_config()->gmem_skip_L1D) bypassL1D = true;
-        }
+        bool bypassL1D = should_bypass_l1d(
+            mf, m_L1D != NULL, m_core->get_config()->gmem_skip_L1D);
         if (bypassL1D) {
           if (m_next_global == NULL) {
             mf->set_status(IN_SHADER_FETCHED,
@@ -3674,6 +3719,7 @@ void shader_core_ctx::cycle() {
   if (!isactive() && get_not_completed() == 0) return;
 
   m_stats->shader_cycles[m_sid]++;
+  // Shader stage order is simulator-visible timing behavior.
   writeback();
   execute();
   read_operands();
@@ -4029,8 +4075,8 @@ bool shader_core_ctx::fetch_unit_response_buffer_full() const { return false; }
 
 void shader_core_ctx::accept_fetch_response(mem_fetch *mf) {
   mf->set_status(IN_SHADER_FETCHED,
-                 m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
-  m_L1I->fill(mf, m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                 shader_cycle_now(m_gpu));
+  m_L1I->fill(mf, shader_cycle_now(m_gpu));
 }
 
 bool shader_core_ctx::ldst_unit_response_buffer_full() const {
@@ -4249,17 +4295,9 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
   }
   for (unsigned i = 0; i < (unsigned)regs.size(); i++) {
     if (m_shader->get_config()->gpgpu_clock_gated_reg_file) {
-      unsigned active_count = 0;
-      for (unsigned i = 0; i < m_shader->get_config()->warp_size;
-           i = i + m_shader->get_config()->n_regfile_gating_group) {
-        for (unsigned j = 0; j < m_shader->get_config()->n_regfile_gating_group;
-             j++) {
-          if (inst.get_active_mask().test(i + j)) {
-            active_count += m_shader->get_config()->n_regfile_gating_group;
-            break;
-          }
-        }
-      }
+      unsigned active_count =
+          active_lanes_for_regfile_gating(inst.get_active_mask(),
+                                          m_shader->get_config());
       m_shader->incregfile_writes(active_count);
     } else {
       m_shader->incregfile_writes(
@@ -4277,17 +4315,9 @@ void opndcoll_rfu_t::dispatch_ready_cu() {
       for (unsigned i = 0; i < (cu->get_num_operands() - cu->get_num_regs());
            i++) {
         if (m_shader->get_config()->gpgpu_clock_gated_reg_file) {
-          unsigned active_count = 0;
-          for (unsigned i = 0; i < m_shader->get_config()->warp_size;
-               i = i + m_shader->get_config()->n_regfile_gating_group) {
-            for (unsigned j = 0;
-                 j < m_shader->get_config()->n_regfile_gating_group; j++) {
-              if (cu->get_active_mask().test(i + j)) {
-                active_count += m_shader->get_config()->n_regfile_gating_group;
-                break;
-              }
-            }
-          }
+          unsigned active_count =
+              active_lanes_for_regfile_gating(cu->get_active_mask(),
+                                              m_shader->get_config());
           m_shader->incnon_rf_operands(active_count);
         } else {
           m_shader->incnon_rf_operands(
@@ -4360,17 +4390,9 @@ void opndcoll_rfu_t::allocate_reads() {
     unsigned operand = op.get_operand();
     m_cu[cu]->collect_operand(operand);
     if (m_shader->get_config()->gpgpu_clock_gated_reg_file) {
-      unsigned active_count = 0;
-      for (unsigned i = 0; i < m_shader->get_config()->warp_size;
-           i = i + m_shader->get_config()->n_regfile_gating_group) {
-        for (unsigned j = 0; j < m_shader->get_config()->n_regfile_gating_group;
-             j++) {
-          if (op.get_active_mask().test(i + j)) {
-            active_count += m_shader->get_config()->n_regfile_gating_group;
-            break;
-          }
-        }
-      }
+      unsigned active_count =
+          active_lanes_for_regfile_gating(op.get_active_mask(),
+                                          m_shader->get_config());
       m_shader->incregfile_reads(active_count);
     } else {
       m_shader->incregfile_reads(
@@ -4620,14 +4642,11 @@ void simt_core_cluster::icnt_inject_request_packet(class mem_fetch *mf) {
   // - For write request and atomic request, the packet contains the data
   // - For read request (i.e. not write nor atomic), the packet only has control
   // metadata
-  unsigned int packet_size = mf->size();
-  if (!mf->get_is_write() && !mf->isatomic()) {
-    packet_size = mf->get_ctrl_size();
-  }
+  unsigned int packet_size = outgoing_packet_size(mf);
   m_stats->m_outgoing_traffic_stats->record_traffic(mf, packet_size);
   unsigned destination = mf->get_sub_partition_id();
   mf->set_status(IN_ICNT_TO_MEM,
-                 m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                 shader_cycle_now(m_gpu));
   if (!mf->get_is_write() && !mf->isatomic())
     ::icnt_push(m_cluster_id, m_config->mem2device(destination), (void *)mf,
                 mf->get_ctrl_size());
@@ -4692,13 +4711,10 @@ void sst_simt_core_cluster::icnt_inject_request_packet_to_SST(
   // - For write request and atomic request, the packet contains the data
   // - For read request (i.e. not write nor atomic), the packet only has control
   // metadata
-  unsigned int packet_size = mf->size();
-  if (!mf->get_is_write() && !mf->isatomic()) {
-    packet_size = mf->get_ctrl_size();
-  }
+  unsigned int packet_size = outgoing_packet_size(mf);
   m_stats->m_outgoing_traffic_stats->record_traffic(mf, packet_size);
   mf->set_status(IN_ICNT_TO_MEM,
-                 m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                 shader_cycle_now(m_gpu));
   switch (mf->get_access_type()) {
     case CONST_ACC_R:
     case INST_ACC_R: {
@@ -4746,11 +4762,10 @@ void simt_core_cluster::icnt_cycle() {
     // The packet size varies depending on the type of request:
     // - For read request and atomic request, the packet contains the data
     // - For write-ack, the packet only has control metadata
-    unsigned int packet_size =
-        (mf->get_is_write()) ? mf->get_ctrl_size() : mf->size();
+    unsigned int packet_size = incoming_packet_size(mf);
     m_stats->m_incoming_traffic_stats->record_traffic(mf, packet_size);
     mf->set_status(IN_CLUSTER_TO_SHADER_QUEUE,
-                   m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                   shader_cycle_now(m_gpu));
     // m_memory_stats->memlatstat_read_done(mf,m_shader_config->max_warps_per_shader);
     m_response_fifo.push_back(mf);
     m_stats->n_mem_to_simt[m_cluster_id] += mf->get_num_flits(false);
@@ -4789,11 +4804,10 @@ void sst_simt_core_cluster::icnt_cycle_SST() {
     // This needs to be validated
     if (mf && mf->isatomic()) mf->do_atomic();
 
-    unsigned int packet_size =
-        (mf->get_is_write()) ? mf->get_ctrl_size() : mf->size();
+    unsigned int packet_size = incoming_packet_size(mf);
     m_stats->m_incoming_traffic_stats->record_traffic(mf, packet_size);
     mf->set_status(IN_CLUSTER_TO_SHADER_QUEUE,
-                   m_gpu->gpu_sim_cycle + m_gpu->gpu_tot_sim_cycle);
+                   shader_cycle_now(m_gpu));
     // m_memory_stats->memlatstat_read_done(mf,m_shader_config->max_warps_per_shader);
     m_response_fifo.push_back(mf);
     m_stats->n_mem_to_simt[m_cluster_id] += mf->get_num_flits(false);
