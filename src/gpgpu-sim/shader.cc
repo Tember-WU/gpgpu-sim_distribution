@@ -125,6 +125,19 @@ bool is_sp_or_int_issue_inst(const warp_inst_t *inst) {
          inst->op != DP_OP && !(inst->op >= SPEC_UNIT_START_ID);
 }
 
+bool dual_issue_slot_available(bool diff_exec_units,
+                               exec_unit_type_t previous_exec_type,
+                               exec_unit_type_t candidate_exec_type) {
+  return !diff_exec_units || previous_exec_type != candidate_exec_type;
+}
+
+bool scheduler_pipeline_has_free(register_set *pipe,
+                                 const shader_core_config *config,
+                                 unsigned scheduler_id) {
+  return pipe->has_free(config->sub_core_model, scheduler_id);
+}
+
+
 unsigned ifetch_access_size(address_type pc, unsigned line_size) {
   unsigned nbytes = 16;
   unsigned offset_in_block = pc & (line_size - 1);
@@ -1541,6 +1554,8 @@ void scheduler_unit::cycle() {
                              // waiting for pending register writes
   bool issued_inst = false;  // of these we issued one
 
+  enum SchedulerIssueResult { ISSUE_NOT_SELECTED, ISSUE_SELECTED, ISSUE_BREAK };
+
   order_warps();
   for (std::vector<shd_warp_t *>::const_iterator iter =
            m_next_cycle_prioritized_warps.begin();
@@ -1617,167 +1632,181 @@ void scheduler_unit::cycle() {
 
             assert(warp(warp_id).inst_in_pipeline());
 
+            const shader_core_config *config = m_shader->m_config;
+            const unsigned scheduler_id = m_id;
+
+            const auto issue_to = [&](register_set *issue_port,
+                                      exec_unit_type_t exec_type) {
+              m_shader->issue_warp(*issue_port, pI, active_mask, warp_id,
+                                   scheduler_id);
+              issued++;
+              issued_inst = true;
+              warp_inst_issued = true;
+              previous_issued_inst_exec_type = exec_type;
+            };
+
+            const auto handle_cdp_issue_latency = [&]() -> bool {
+              // Jin: special for CDP api
+              if (pI->m_is_cdp && !warp(warp_id).m_cdp_dummy) {
+                assert(warp(warp_id).m_cdp_latency == 0);
+
+                if (pI->m_is_cdp == 1)
+                  warp(warp_id).m_cdp_latency =
+                      config->gpgpu_ctx->func_sim->cdp_latency[pI->m_is_cdp - 1];
+                else  // cudaLaunchDeviceV2 and cudaGetParameterBufferV2
+                  warp(warp_id).m_cdp_latency =
+                      config->gpgpu_ctx->func_sim->cdp_latency[pI->m_is_cdp - 1] +
+                      config->gpgpu_ctx->func_sim->cdp_latency[pI->m_is_cdp] *
+                          active_mask.count();
+                warp(warp_id).m_cdp_dummy = true;
+                return true;
+              } else if (pI->m_is_cdp && warp(warp_id).m_cdp_dummy) {
+                assert(warp(warp_id).m_cdp_latency == 0);
+                warp(warp_id).m_cdp_dummy = false;
+              }
+              return false;
+            };
+
+            const auto try_issue_memory = [&]() -> SchedulerIssueResult {
+              if (scheduler_pipeline_has_free(m_mem_out, config, scheduler_id) &&
+                  dual_issue_slot_available(diff_exec_units,
+                                            previous_issued_inst_exec_type,
+                                            exec_unit_type_t::MEM)) {
+                issue_to(m_mem_out, exec_unit_type_t::MEM);
+                return ISSUE_SELECTED;
+              }
+              return ISSUE_NOT_SELECTED;
+            };
+
+            const auto try_issue_sp_or_int = [&]() -> SchedulerIssueResult {
+              bool execute_on_SP = false;
+              bool execute_on_INT = false;
+
+              bool sp_pipe_avail =
+                  (config->gpgpu_num_sp_units > 0) &&
+                  scheduler_pipeline_has_free(m_sp_out, config, scheduler_id);
+              bool int_pipe_avail =
+                  (config->gpgpu_num_int_units > 0) &&
+                  scheduler_pipeline_has_free(m_int_out, config, scheduler_id);
+
+              // if INT unit pipline exist, then execute ALU and INT
+              // operations on INT unit and SP-FPU on SP unit (like in Volta)
+              // if INT unit pipline does not exist, then execute all ALU, INT
+              // and SP operations on SP unit (as in Fermi, Pascal GPUs)
+              if (config->gpgpu_num_int_units > 0 && int_pipe_avail &&
+                  pI->op != SP_OP &&
+                  dual_issue_slot_available(diff_exec_units,
+                                            previous_issued_inst_exec_type,
+                                            exec_unit_type_t::INT))
+                execute_on_INT = true;
+              else if (sp_pipe_avail &&
+                       (config->gpgpu_num_int_units == 0 ||
+                        (config->gpgpu_num_int_units > 0 && pI->op == SP_OP)) &&
+                       dual_issue_slot_available(diff_exec_units,
+                                                 previous_issued_inst_exec_type,
+                                                 exec_unit_type_t::SP))
+                execute_on_SP = true;
+
+              if ((execute_on_INT || execute_on_SP) &&
+                  handle_cdp_issue_latency())
+                return ISSUE_BREAK;
+
+              if (execute_on_SP) {
+                issue_to(m_sp_out, exec_unit_type_t::SP);
+                return ISSUE_SELECTED;
+              } else if (execute_on_INT) {
+                issue_to(m_int_out, exec_unit_type_t::INT);
+                return ISSUE_SELECTED;
+              }
+              return ISSUE_NOT_SELECTED;
+            };
+
+            const auto try_issue_dp = [&]() -> SchedulerIssueResult {
+              bool dp_pipe_avail =
+                  (config->gpgpu_num_dp_units > 0) &&
+                  scheduler_pipeline_has_free(m_dp_out, config, scheduler_id);
+
+              if (dp_pipe_avail) {
+                issue_to(m_dp_out, exec_unit_type_t::DP);
+                return ISSUE_SELECTED;
+              }
+              return ISSUE_NOT_SELECTED;
+            };
+
+            const auto try_issue_sfu = [&]() -> SchedulerIssueResult {
+              bool sfu_pipe_avail =
+                  (config->gpgpu_num_sfu_units > 0) &&
+                  scheduler_pipeline_has_free(m_sfu_out, config, scheduler_id);
+
+              if (sfu_pipe_avail) {
+                issue_to(m_sfu_out, exec_unit_type_t::SFU);
+                return ISSUE_SELECTED;
+              }
+              return ISSUE_NOT_SELECTED;
+            };
+
+            const auto try_issue_tensor = [&]() -> SchedulerIssueResult {
+              bool tensor_core_pipe_avail =
+                  (config->gpgpu_num_tensor_core_units > 0) &&
+                  scheduler_pipeline_has_free(m_tensor_core_out, config,
+                                              scheduler_id);
+
+              if (tensor_core_pipe_avail) {
+                issue_to(m_tensor_core_out, exec_unit_type_t::TENSOR);
+                return ISSUE_SELECTED;
+              }
+              return ISSUE_NOT_SELECTED;
+            };
+
+            const auto try_issue_specialized = [&]() -> SchedulerIssueResult {
+              unsigned spec_id = pI->op - SPEC_UNIT_START_ID;
+              assert(spec_id < config->m_specialized_unit.size());
+              register_set *spec_reg_set = m_spec_cores_out[spec_id];
+              bool spec_pipe_avail =
+                  (config->m_specialized_unit[spec_id].num_units > 0) &&
+                  scheduler_pipeline_has_free(spec_reg_set, config, scheduler_id);
+
+              if (spec_pipe_avail) {
+                issue_to(spec_reg_set, exec_unit_type_t::SPECIALIZED);
+                return ISSUE_SELECTED;
+              }
+              return ISSUE_NOT_SELECTED;
+            };
+
+            SchedulerIssueResult issue_result = ISSUE_NOT_SELECTED;
+            // Keep this chain ordered: it is the scheduler-visible execution-unit
+            // tie-break for a scoreboard-ready instruction.
             if (is_memory_issue_inst(pI)) {
-              if (m_mem_out->has_free(m_shader->m_config->sub_core_model,
-                                      m_id) &&
-                  (!diff_exec_units ||
-                   previous_issued_inst_exec_type != exec_unit_type_t::MEM)) {
-                m_shader->issue_warp(*m_mem_out, pI, active_mask, warp_id,
-                                     m_id);
-                issued++;
-                issued_inst = true;
-                warp_inst_issued = true;
-                previous_issued_inst_exec_type = exec_unit_type_t::MEM;
-              }
-            } else {
-              // This code need to be refactored
-              if (is_sp_or_int_issue_inst(pI)) {
-                bool execute_on_SP = false;
-                bool execute_on_INT = false;
+              issue_result = try_issue_memory();
+            } else if (is_sp_or_int_issue_inst(pI)) {
+              issue_result = try_issue_sp_or_int();
+            } else if ((config->gpgpu_num_dp_units > 0) &&
+                       (pI->op == DP_OP) &&
+                       dual_issue_slot_available(diff_exec_units,
+                                                 previous_issued_inst_exec_type,
+                                                 exec_unit_type_t::DP)) {
+              issue_result = try_issue_dp();
+            }  // If the DP units = 0 (like in Fermi archi), then execute DP
+               // inst on SFU unit
+            else if (((config->gpgpu_num_dp_units == 0 && pI->op == DP_OP) ||
+                      (pI->op == SFU_OP) || (pI->op == ALU_SFU_OP)) &&
+                     dual_issue_slot_available(diff_exec_units,
+                                               previous_issued_inst_exec_type,
+                                               exec_unit_type_t::SFU)) {
+              issue_result = try_issue_sfu();
+            } else if ((pI->op == TENSOR_CORE_OP) &&
+                       dual_issue_slot_available(diff_exec_units,
+                                                 previous_issued_inst_exec_type,
+                                                 exec_unit_type_t::TENSOR)) {
+              issue_result = try_issue_tensor();
+            } else if ((pI->op >= SPEC_UNIT_START_ID) &&
+                       dual_issue_slot_available(diff_exec_units,
+                                                 previous_issued_inst_exec_type,
+                                                 exec_unit_type_t::SPECIALIZED)) {
+              issue_result = try_issue_specialized();
+            }
 
-                bool sp_pipe_avail =
-                    (m_shader->m_config->gpgpu_num_sp_units > 0) &&
-                    m_sp_out->has_free(m_shader->m_config->sub_core_model,
-                                       m_id);
-                bool int_pipe_avail =
-                    (m_shader->m_config->gpgpu_num_int_units > 0) &&
-                    m_int_out->has_free(m_shader->m_config->sub_core_model,
-                                        m_id);
-
-                // if INT unit pipline exist, then execute ALU and INT
-                // operations on INT unit and SP-FPU on SP unit (like in Volta)
-                // if INT unit pipline does not exist, then execute all ALU, INT
-                // and SP operations on SP unit (as in Fermi, Pascal GPUs)
-                if (m_shader->m_config->gpgpu_num_int_units > 0 &&
-                    int_pipe_avail && pI->op != SP_OP &&
-                    !(diff_exec_units &&
-                      previous_issued_inst_exec_type == exec_unit_type_t::INT))
-                  execute_on_INT = true;
-                else if (sp_pipe_avail &&
-                         (m_shader->m_config->gpgpu_num_int_units == 0 ||
-                          (m_shader->m_config->gpgpu_num_int_units > 0 &&
-                           pI->op == SP_OP)) &&
-                         !(diff_exec_units && previous_issued_inst_exec_type ==
-                                                  exec_unit_type_t::SP))
-                  execute_on_SP = true;
-
-                if (execute_on_INT || execute_on_SP) {
-                  // Jin: special for CDP api
-                  if (pI->m_is_cdp && !warp(warp_id).m_cdp_dummy) {
-                    assert(warp(warp_id).m_cdp_latency == 0);
-
-                    if (pI->m_is_cdp == 1)
-                      warp(warp_id).m_cdp_latency =
-                          m_shader->m_config->gpgpu_ctx->func_sim
-                              ->cdp_latency[pI->m_is_cdp - 1];
-                    else  // cudaLaunchDeviceV2 and cudaGetParameterBufferV2
-                      warp(warp_id).m_cdp_latency =
-                          m_shader->m_config->gpgpu_ctx->func_sim
-                              ->cdp_latency[pI->m_is_cdp - 1] +
-                          m_shader->m_config->gpgpu_ctx->func_sim
-                                  ->cdp_latency[pI->m_is_cdp] *
-                              active_mask.count();
-                    warp(warp_id).m_cdp_dummy = true;
-                    break;
-                  } else if (pI->m_is_cdp && warp(warp_id).m_cdp_dummy) {
-                    assert(warp(warp_id).m_cdp_latency == 0);
-                    warp(warp_id).m_cdp_dummy = false;
-                  }
-                }
-
-                if (execute_on_SP) {
-                  m_shader->issue_warp(*m_sp_out, pI, active_mask, warp_id,
-                                       m_id);
-                  issued++;
-                  issued_inst = true;
-                  warp_inst_issued = true;
-                  previous_issued_inst_exec_type = exec_unit_type_t::SP;
-                } else if (execute_on_INT) {
-                  m_shader->issue_warp(*m_int_out, pI, active_mask, warp_id,
-                                       m_id);
-                  issued++;
-                  issued_inst = true;
-                  warp_inst_issued = true;
-                  previous_issued_inst_exec_type = exec_unit_type_t::INT;
-                }
-              } else if ((m_shader->m_config->gpgpu_num_dp_units > 0) &&
-                         (pI->op == DP_OP) &&
-                         !(diff_exec_units && previous_issued_inst_exec_type ==
-                                                  exec_unit_type_t::DP)) {
-                bool dp_pipe_avail =
-                    (m_shader->m_config->gpgpu_num_dp_units > 0) &&
-                    m_dp_out->has_free(m_shader->m_config->sub_core_model,
-                                       m_id);
-
-                if (dp_pipe_avail) {
-                  m_shader->issue_warp(*m_dp_out, pI, active_mask, warp_id,
-                                       m_id);
-                  issued++;
-                  issued_inst = true;
-                  warp_inst_issued = true;
-                  previous_issued_inst_exec_type = exec_unit_type_t::DP;
-                }
-              }  // If the DP units = 0 (like in Fermi archi), then execute DP
-                 // inst on SFU unit
-              else if (((m_shader->m_config->gpgpu_num_dp_units == 0 &&
-                         pI->op == DP_OP) ||
-                        (pI->op == SFU_OP) || (pI->op == ALU_SFU_OP)) &&
-                       !(diff_exec_units && previous_issued_inst_exec_type ==
-                                                exec_unit_type_t::SFU)) {
-                bool sfu_pipe_avail =
-                    (m_shader->m_config->gpgpu_num_sfu_units > 0) &&
-                    m_sfu_out->has_free(m_shader->m_config->sub_core_model,
-                                        m_id);
-
-                if (sfu_pipe_avail) {
-                  m_shader->issue_warp(*m_sfu_out, pI, active_mask, warp_id,
-                                       m_id);
-                  issued++;
-                  issued_inst = true;
-                  warp_inst_issued = true;
-                  previous_issued_inst_exec_type = exec_unit_type_t::SFU;
-                }
-              } else if ((pI->op == TENSOR_CORE_OP) &&
-                         !(diff_exec_units && previous_issued_inst_exec_type ==
-                                                  exec_unit_type_t::TENSOR)) {
-                bool tensor_core_pipe_avail =
-                    (m_shader->m_config->gpgpu_num_tensor_core_units > 0) &&
-                    m_tensor_core_out->has_free(
-                        m_shader->m_config->sub_core_model, m_id);
-
-                if (tensor_core_pipe_avail) {
-                  m_shader->issue_warp(*m_tensor_core_out, pI, active_mask,
-                                       warp_id, m_id);
-                  issued++;
-                  issued_inst = true;
-                  warp_inst_issued = true;
-                  previous_issued_inst_exec_type = exec_unit_type_t::TENSOR;
-                }
-              } else if ((pI->op >= SPEC_UNIT_START_ID) &&
-                         !(diff_exec_units &&
-                           previous_issued_inst_exec_type ==
-                               exec_unit_type_t::SPECIALIZED)) {
-                unsigned spec_id = pI->op - SPEC_UNIT_START_ID;
-                assert(spec_id < m_shader->m_config->m_specialized_unit.size());
-                register_set *spec_reg_set = m_spec_cores_out[spec_id];
-                bool spec_pipe_avail =
-                    (m_shader->m_config->m_specialized_unit[spec_id].num_units >
-                     0) &&
-                    spec_reg_set->has_free(m_shader->m_config->sub_core_model,
-                                           m_id);
-
-                if (spec_pipe_avail) {
-                  m_shader->issue_warp(*spec_reg_set, pI, active_mask, warp_id,
-                                       m_id);
-                  issued++;
-                  issued_inst = true;
-                  warp_inst_issued = true;
-                  previous_issued_inst_exec_type =
-                      exec_unit_type_t::SPECIALIZED;
-                }
-              }
-
-            }  // end of else
+            if (issue_result == ISSUE_BREAK) break;
           } else {
             SCHED_DPRINTF(
                 "Warp (warp_id %u, dynamic_warp_id %u) fails scoreboard\n",
