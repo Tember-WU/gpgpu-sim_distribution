@@ -279,6 +279,61 @@ bool service_global_memory_writeback(mem_fetch *&next_global,
   return true;
 }
 
+struct CuSearchBounds {
+  CuSearchBounds(unsigned lower, unsigned upper) : lower(lower), upper(upper) {}
+
+  unsigned lower;
+  unsigned upper;
+};
+
+CuSearchBounds collector_search_bounds(register_set *input,
+                                       unsigned cu_set_size,
+                                       bool sub_core_model,
+                                       unsigned num_warp_scheds) {
+  if (!sub_core_model) return CuSearchBounds(0, cu_set_size);
+
+  unsigned reg_id = input->get_ready_reg_id();
+  unsigned schd_id = input->get_schd_id(reg_id);
+  assert(cu_set_size % num_warp_scheds == 0 &&
+         cu_set_size >= num_warp_scheds);
+  unsigned cus_per_sched = cu_set_size / num_warp_scheds;
+  unsigned lower = schd_id * cus_per_sched;
+  unsigned upper = lower + cus_per_sched;
+  assert(0 <= lower && upper <= cu_set_size);
+  return CuSearchBounds(lower, upper);
+}
+
+template <typename CuSet, typename Arbiter>
+bool allocate_first_free_cu(CuSet &cu_set, const CuSearchBounds &bounds,
+                            register_set *input, register_set *output,
+                            Arbiter &arbiter) {
+  for (unsigned k = bounds.lower; k < bounds.upper; k++) {
+    if (cu_set[k].is_free()) {
+      typename CuSet::value_type *cu = &cu_set[k];
+      bool allocated = cu->allocate(input, output);
+      arbiter.add_read_requests(cu);
+      return allocated;
+    }
+  }
+  return false;
+}
+
+template <typename Op, typename CollectorUnits>
+void collect_read_operand_and_account(Op &op, CollectorUnits &collector_units,
+                                      shader_core_ctx *shader) {
+  unsigned cu = op.get_oc_id();
+  unsigned operand = op.get_operand();
+  collector_units[cu]->collect_operand(operand);
+  if (shader->get_config()->gpgpu_clock_gated_reg_file) {
+    unsigned active_count =
+        active_lanes_for_regfile_gating(op.get_active_mask(),
+                                        shader->get_config());
+    shader->incregfile_reads(active_count);
+  } else {
+    shader->incregfile_reads(shader->get_config()->warp_size);
+  }
+}
+
 }  // namespace
 
 mem_fetch *shader_core_mem_fetch_allocator::alloc(
@@ -4415,40 +4470,20 @@ void opndcoll_rfu_t::dispatch_ready_cu() {
 void opndcoll_rfu_t::allocate_cu(unsigned port_num) {
   input_port_t &inp = m_in_ports[port_num];
   for (unsigned i = 0; i < inp.m_in.size(); i++) {
-    if ((*inp.m_in[i]).has_ready()) {
-      // find a free cu
-      for (unsigned j = 0; j < inp.m_cu_sets.size(); j++) {
-        std::vector<collector_unit_t> &cu_set = m_cus[inp.m_cu_sets[j]];
-        bool allocated = false;
-        unsigned cuLowerBound = 0;
-        unsigned cuUpperBound = cu_set.size();
-        unsigned schd_id;
-        if (sub_core_model) {
-          // Sub core model only allocates on the subset of CUs assigned to the
-          // scheduler that issued
-          unsigned reg_id = (*inp.m_in[i]).get_ready_reg_id();
-          schd_id = (*inp.m_in[i]).get_schd_id(reg_id);
-          assert(cu_set.size() % m_num_warp_scheds == 0 &&
-                 cu_set.size() >= m_num_warp_scheds);
-          unsigned cusPerSched = cu_set.size() / m_num_warp_scheds;
-          cuLowerBound = schd_id * cusPerSched;
-          cuUpperBound = cuLowerBound + cusPerSched;
-          assert(0 <= cuLowerBound && cuUpperBound <= cu_set.size());
-        }
-        for (unsigned k = cuLowerBound; k < cuUpperBound; k++) {
-          if (cu_set[k].is_free()) {
-            collector_unit_t *cu = &cu_set[k];
-            allocated = cu->allocate(inp.m_in[i], inp.m_out[i]);
-            m_arbiter.add_read_requests(cu);
-            break;
-          }
-        }
-        if (allocated) break;  // cu has been allocated, no need to search more.
-      }
-      // break;  // can only service a single input, if it failed it will fail
-      // for
-      // others.
+    if (!(*inp.m_in[i]).has_ready()) continue;
+
+    for (unsigned j = 0; j < inp.m_cu_sets.size(); j++) {
+      std::vector<collector_unit_t> &cu_set = m_cus[inp.m_cu_sets[j]];
+      CuSearchBounds bounds = collector_search_bounds(
+          inp.m_in[i], cu_set.size(), sub_core_model, m_num_warp_scheds);
+      bool allocated =
+          allocate_first_free_cu(cu_set, bounds, inp.m_in[i], inp.m_out[i],
+                                 m_arbiter);
+      if (allocated) break;  // cu has been allocated, no need to search more.
     }
+    // break;  // can only service a single input, if it failed it will fail
+    // for
+    // others.
   }
 }
 
@@ -4469,18 +4504,7 @@ void opndcoll_rfu_t::allocate_reads() {
   std::map<unsigned, op_t>::iterator r;
   for (r = read_ops.begin(); r != read_ops.end(); ++r) {
     op_t &op = r->second;
-    unsigned cu = op.get_oc_id();
-    unsigned operand = op.get_operand();
-    m_cu[cu]->collect_operand(operand);
-    if (m_shader->get_config()->gpgpu_clock_gated_reg_file) {
-      unsigned active_count =
-          active_lanes_for_regfile_gating(op.get_active_mask(),
-                                          m_shader->get_config());
-      m_shader->incregfile_reads(active_count);
-    } else {
-      m_shader->incregfile_reads(
-          m_shader->get_config()->warp_size);  // op.get_active_count());
-    }
+    collect_read_operand_and_account(op, m_cu, m_shader);
   }
 }
 
