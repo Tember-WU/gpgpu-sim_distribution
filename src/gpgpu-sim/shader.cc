@@ -191,6 +191,94 @@ void aggregate_shader_sub_stats(shader_core_ctx **cores, unsigned num_cores,
   css = total_css;
 }
 
+template <typename PendingWrites, typename PendingLdgsts>
+bool drain_ldst_writeback_instruction(
+    warp_inst_t &next_wb, opndcoll_rfu_t *operand_collector,
+    PendingWrites &pending_writes, PendingLdgsts &pending_ldgsts,
+    Scoreboard *scoreboard, shader_core_ctx *core, gpgpu_sim *gpu,
+    unsigned long long &last_inst_gpu_sim_cycle,
+    unsigned long long &last_inst_gpu_tot_sim_cycle) {
+  if (next_wb.empty()) return false;
+  if (!operand_collector->writeback(next_wb)) return false;
+
+  bool insn_completed = false;
+  for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
+    if (next_wb.out[r] > 0) {
+      if (next_wb.space.get_type() != shared_space) {
+        assert(pending_writes[next_wb.warp_id()][next_wb.out[r]] > 0);
+        unsigned still_pending =
+            --pending_writes[next_wb.warp_id()][next_wb.out[r]];
+        if (!still_pending) {
+          pending_writes[next_wb.warp_id()].erase(next_wb.out[r]);
+          scoreboard->releaseRegister(next_wb.warp_id(), next_wb.out[r]);
+          insn_completed = true;
+        }
+      } else {
+        scoreboard->releaseRegister(next_wb.warp_id(), next_wb.out[r]);
+        insn_completed = true;
+      }
+    } else if (next_wb.m_is_ldgsts) {
+      pending_ldgsts[next_wb.warp_id()][next_wb.pc][next_wb.get_addr(0)]--;
+      if (pending_ldgsts[next_wb.warp_id()][next_wb.pc]
+                       [next_wb.get_addr(0)] == 0) {
+        insn_completed = true;
+      }
+      break;
+    }
+  }
+  if (insn_completed) {
+    core->warp_inst_complete(next_wb);
+    if (next_wb.m_is_ldgsts) {
+      core->unset_depbar(next_wb);
+    }
+  }
+
+  next_wb.clear();
+  last_inst_gpu_sim_cycle = gpu->gpu_sim_cycle;
+  last_inst_gpu_tot_sim_cycle = gpu->gpu_tot_sim_cycle;
+  return true;
+}
+
+bool service_shared_memory_writeback(warp_inst_t *shared_pipeline_reg,
+                                     warp_inst_t &next_wb,
+                                     shader_core_ctx *core) {
+  if (shared_pipeline_reg->empty()) return false;
+
+  next_wb = *shared_pipeline_reg;
+  if (next_wb.isatomic()) {
+    next_wb.do_atomic();
+    core->decrement_atomic_count(next_wb.warp_id(), next_wb.active_count());
+  }
+  core->dec_inst_in_pipeline(shared_pipeline_reg->warp_id());
+  shared_pipeline_reg->clear();
+  return true;
+}
+
+template <typename Cache>
+bool service_cache_writeback_response(Cache *cache, warp_inst_t &next_wb) {
+  if (!cache->access_ready()) return false;
+
+  mem_fetch *mf = cache->next_access();
+  next_wb = mf->get_inst();
+  delete mf;
+  return true;
+}
+
+bool service_global_memory_writeback(mem_fetch *&next_global,
+                                     warp_inst_t &next_wb,
+                                     shader_core_ctx *core) {
+  if (!next_global) return false;
+
+  next_wb = next_global->get_inst();
+  if (next_global->isatomic()) {
+    core->decrement_atomic_count(
+        next_global->get_wid(), next_global->get_access_warp_mask().count());
+  }
+  delete next_global;
+  next_global = NULL;
+  return true;
+}
+
 }  // namespace
 
 mem_fetch *shader_core_mem_fetch_allocator::alloc(
@@ -2813,50 +2901,10 @@ void ldst_unit::issue(register_set &reg_set) {
 }
 
 void ldst_unit::writeback() {
-  // process next instruction that is going to writeback
-  if (!m_next_wb.empty()) {
-    if (m_operand_collector->writeback(m_next_wb)) {
-      bool insn_completed = false;
-      for (unsigned r = 0; r < MAX_OUTPUT_VALUES; r++) {
-        if (m_next_wb.out[r] > 0) {
-          if (m_next_wb.space.get_type() != shared_space) {
-            assert(m_pending_writes[m_next_wb.warp_id()][m_next_wb.out[r]] > 0);
-            unsigned still_pending =
-                --m_pending_writes[m_next_wb.warp_id()][m_next_wb.out[r]];
-            if (!still_pending) {
-              m_pending_writes[m_next_wb.warp_id()].erase(m_next_wb.out[r]);
-              m_scoreboard->releaseRegister(m_next_wb.warp_id(),
-                                            m_next_wb.out[r]);
-              insn_completed = true;
-            }
-          } else {  // shared
-            m_scoreboard->releaseRegister(m_next_wb.warp_id(),
-                                          m_next_wb.out[r]);
-            insn_completed = true;
-          }
-        } else if (m_next_wb.m_is_ldgsts) {  // for LDGSTS instructions where no
-                                             // output register is used
-          m_pending_ldgsts[m_next_wb.warp_id()][m_next_wb.pc]
-                          [m_next_wb.get_addr(0)]--;
-          if (m_pending_ldgsts[m_next_wb.warp_id()][m_next_wb.pc]
-                              [m_next_wb.get_addr(0)] == 0) {
-            insn_completed = true;
-          }
-          break;
-        }
-      }
-      if (insn_completed) {
-        m_core->warp_inst_complete(m_next_wb);
-        if (m_next_wb.m_is_ldgsts) {
-          m_core->unset_depbar(m_next_wb);
-        }
-      }
-
-      m_next_wb.clear();
-      m_last_inst_gpu_sim_cycle = m_core->get_gpu()->gpu_sim_cycle;
-      m_last_inst_gpu_tot_sim_cycle = m_core->get_gpu()->gpu_tot_sim_cycle;
-    }
-  }
+  drain_ldst_writeback_instruction(
+      m_next_wb, m_operand_collector, m_pending_writes, m_pending_ldgsts,
+      m_scoreboard, m_core, m_core->get_gpu(), m_last_inst_gpu_sim_cycle,
+      m_last_inst_gpu_tot_sim_cycle);
 
   unsigned serviced_client = -1;
   for (unsigned c = 0; m_next_wb.empty() && (c < m_num_writeback_clients);
@@ -2864,52 +2912,29 @@ void ldst_unit::writeback() {
     unsigned next_client = (c + m_writeback_arb) % m_num_writeback_clients;
     switch (next_client) {
       case 0:  // shared memory
-        if (!m_pipeline_reg[0]->empty()) {
-          m_next_wb = *m_pipeline_reg[0];
-          if (m_next_wb.isatomic()) {
-            m_next_wb.do_atomic();
-            m_core->decrement_atomic_count(m_next_wb.warp_id(),
-                                           m_next_wb.active_count());
-          }
-          m_core->dec_inst_in_pipeline(m_pipeline_reg[0]->warp_id());
-          m_pipeline_reg[0]->clear();
+        if (service_shared_memory_writeback(m_pipeline_reg[0], m_next_wb,
+                                            m_core)) {
           serviced_client = next_client;
         }
         break;
       case 1:  // texture response
-        if (m_L1T->access_ready()) {
-          mem_fetch *mf = m_L1T->next_access();
-          m_next_wb = mf->get_inst();
-          delete mf;
+        if (service_cache_writeback_response(m_L1T, m_next_wb)) {
           serviced_client = next_client;
         }
         break;
       case 2:  // const cache response
-        if (m_L1C->access_ready()) {
-          mem_fetch *mf = m_L1C->next_access();
-          m_next_wb = mf->get_inst();
-          delete mf;
+        if (service_cache_writeback_response(m_L1C, m_next_wb)) {
           serviced_client = next_client;
         }
         break;
       case 3:  // global/local
-        if (m_next_global) {
-          m_next_wb = m_next_global->get_inst();
-          if (m_next_global->isatomic()) {
-            m_core->decrement_atomic_count(
-                m_next_global->get_wid(),
-                m_next_global->get_access_warp_mask().count());
-          }
-          delete m_next_global;
-          m_next_global = NULL;
+        if (service_global_memory_writeback(m_next_global, m_next_wb,
+                                            m_core)) {
           serviced_client = next_client;
         }
         break;
       case 4:
-        if (m_L1D && m_L1D->access_ready()) {
-          mem_fetch *mf = m_L1D->next_access();
-          m_next_wb = mf->get_inst();
-          delete mf;
+        if (m_L1D && service_cache_writeback_response(m_L1D, m_next_wb)) {
           serviced_client = next_client;
         }
         break;
