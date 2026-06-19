@@ -113,6 +113,84 @@ unsigned checked_active_lanes_in_pipeline(unsigned active_count,
   return active_count;
 }
 
+bool is_memory_issue_inst(const warp_inst_t *inst) {
+  return (inst->op == LOAD_OP) || (inst->op == STORE_OP) ||
+         (inst->op == MEMORY_BARRIER_OP) ||
+         (inst->op == TENSOR_CORE_LOAD_OP) ||
+         (inst->op == TENSOR_CORE_STORE_OP);
+}
+
+bool is_sp_or_int_issue_inst(const warp_inst_t *inst) {
+  return inst->op != TENSOR_CORE_OP && inst->op != SFU_OP &&
+         inst->op != DP_OP && !(inst->op >= SPEC_UNIT_START_ID);
+}
+
+unsigned ifetch_access_size(address_type pc, unsigned line_size) {
+  unsigned nbytes = 16;
+  unsigned offset_in_block = pc & (line_size - 1);
+  if ((offset_in_block + nbytes) > line_size)
+    nbytes = line_size - offset_in_block;
+  return nbytes;
+}
+
+mem_fetch *new_inst_fetch_request(address_type ppc, unsigned nbytes,
+                                  shd_warp_t *warp, unsigned warp_id,
+                                  unsigned sid, unsigned tpc,
+                                  const memory_config *memory_config,
+                                  gpgpu_sim *gpu) {
+  mem_access_t acc(INST_ACC_R, ppc, nbytes, false, gpu->gpgpu_ctx);
+  return new mem_fetch(acc, NULL, warp->get_streamID(), READ_PACKET_SIZE,
+                       warp_id, sid, tpc, memory_config,
+                       shader_cycle_now(gpu));
+}
+
+void accept_data_response(mem_fetch *mf, shader_core_ctx *core,
+                          memory_stats_t *memory_stats) {
+  memory_stats->memlatstat_read_done(mf);
+  core->accept_ldst_unit_response(mf);
+}
+
+bool service_cluster_response_fifo(std::list<mem_fetch *> &response_fifo,
+                                   shader_core_ctx **cores,
+                                   const shader_core_config *config,
+                                   memory_stats_t *memory_stats) {
+  if (response_fifo.empty()) return false;
+
+  mem_fetch *mf = response_fifo.front();
+  unsigned cid = config->sid_to_cid(mf->get_sid());
+  if (mf->get_access_type() == INST_ACC_R) {
+    if (!cores[cid]->fetch_unit_response_buffer_full()) {
+      response_fifo.pop_front();
+      cores[cid]->accept_fetch_response(mf);
+      return true;
+    }
+  } else {
+    if (!cores[cid]->ldst_unit_response_buffer_full()) {
+      response_fifo.pop_front();
+      accept_data_response(mf, cores[cid], memory_stats);
+      return true;
+    }
+  }
+  return false;
+}
+
+typedef void (shader_core_ctx::*ShaderSubStatsGetter)(
+    struct cache_sub_stats &css) const;
+
+void aggregate_shader_sub_stats(shader_core_ctx **cores, unsigned num_cores,
+                                ShaderSubStatsGetter getter,
+                                struct cache_sub_stats &css) {
+  struct cache_sub_stats temp_css;
+  struct cache_sub_stats total_css;
+  temp_css.clear();
+  total_css.clear();
+  for (unsigned i = 0; i < num_cores; ++i) {
+    (cores[i]->*getter)(temp_css);
+    total_css += temp_css;
+  }
+  css = total_css;
+}
+
 }  // namespace
 
 mem_fetch *shader_core_mem_fetch_allocator::alloc(
@@ -1039,19 +1117,14 @@ void shader_core_ctx::fetch() {
           address_type pc;
           pc = m_warp[warp_id]->get_pc();
           address_type ppc = pc + PROGRAM_MEM_START;
-          unsigned nbytes = 16;
-          unsigned offset_in_block =
-              pc & (m_config->m_L1I_config.get_line_sz() - 1);
-          if ((offset_in_block + nbytes) > m_config->m_L1I_config.get_line_sz())
-            nbytes = (m_config->m_L1I_config.get_line_sz() - offset_in_block);
+          unsigned nbytes =
+              ifetch_access_size(pc, m_config->m_L1I_config.get_line_sz());
 
           // TODO: replace with use of allocator
           // mem_fetch *mf = m_mem_fetch_allocator->alloc()
-          mem_access_t acc(INST_ACC_R, ppc, nbytes, false, m_gpu->gpgpu_ctx);
-          mem_fetch *mf = new mem_fetch(
-              acc, NULL, m_warp[warp_id]->get_streamID(), READ_PACKET_SIZE,
-              warp_id, m_sid, m_tpc, m_memory_config,
-              shader_cycle_now(m_gpu));
+          mem_fetch *mf = new_inst_fetch_request(
+              ppc, nbytes, m_warp[warp_id], warp_id, m_sid, m_tpc,
+              m_memory_config, m_gpu);
           std::list<cache_event> events;
           enum cache_request_status status;
           if (m_config->perfect_inst_const_cache) {
@@ -1401,10 +1474,7 @@ void scheduler_unit::cycle() {
 
             assert(warp(warp_id).inst_in_pipeline());
 
-            if ((pI->op == LOAD_OP) || (pI->op == STORE_OP) ||
-                (pI->op == MEMORY_BARRIER_OP) ||
-                (pI->op == TENSOR_CORE_LOAD_OP) ||
-                (pI->op == TENSOR_CORE_STORE_OP)) {
+            if (is_memory_issue_inst(pI)) {
               if (m_mem_out->has_free(m_shader->m_config->sub_core_model,
                                       m_id) &&
                   (!diff_exec_units ||
@@ -1418,8 +1488,7 @@ void scheduler_unit::cycle() {
               }
             } else {
               // This code need to be refactored
-              if (pI->op != TENSOR_CORE_OP && pI->op != SFU_OP &&
-                  pI->op != DP_OP && !(pI->op >= SPEC_UNIT_START_ID)) {
+              if (is_sp_or_int_issue_inst(pI)) {
                 bool execute_on_SP = false;
                 bool execute_on_INT = false;
 
@@ -2130,10 +2199,8 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
 
       if (inst.accessq_empty()) return result;
 
-      mem_fetch *mf =
-          m_mf_allocator->alloc(inst, inst.accessq_back(),
-                                m_core->get_gpu()->gpu_sim_cycle +
-                                    m_core->get_gpu()->gpu_tot_sim_cycle);
+      mem_fetch *mf = m_mf_allocator->alloc(
+          inst, inst.accessq_back(), shader_cycle_now(m_core->get_gpu()));
       unsigned bank_id = m_config->m_L1D_config.set_bank(mf->get_addr());
       assert(bank_id < m_config->m_L1D_config.l1_banks);
 
@@ -2164,10 +2231,8 @@ mem_stage_stall_type ldst_unit::process_memory_access_queue_l1cache(
 
     return result;
   } else {
-    mem_fetch *mf =
-        m_mf_allocator->alloc(inst, inst.accessq_back(),
-                              m_core->get_gpu()->gpu_sim_cycle +
-                                  m_core->get_gpu()->gpu_tot_sim_cycle);
+    mem_fetch *mf = m_mf_allocator->alloc(
+        inst, inst.accessq_back(), shader_cycle_now(m_core->get_gpu()));
     std::list<cache_event> events;
     enum cache_request_status status = cache->access(
         mf->get_addr(), mf,
@@ -2185,9 +2250,7 @@ void ldst_unit::L1_latency_queue_cycle() {
       std::list<cache_event> events;
       enum cache_request_status status =
           m_L1D->access(mf_next->get_addr(), mf_next,
-                        m_core->get_gpu()->gpu_sim_cycle +
-                            m_core->get_gpu()->gpu_tot_sim_cycle,
-                        events);
+                        shader_cycle_now(m_core->get_gpu()), events);
 
       bool write_sent = was_write_sent(events);
       bool read_sent = was_read_sent(events);
@@ -2902,17 +2965,14 @@ void ldst_unit::cycle() {
     mem_fetch *mf = m_response_fifo.front();
     if (mf->get_access_type() == TEXTURE_ACC_R) {
       if (m_L1T->fill_port_free()) {
-        m_L1T->fill(mf, m_core->get_gpu()->gpu_sim_cycle +
-                            m_core->get_gpu()->gpu_tot_sim_cycle);
+        m_L1T->fill(mf, shader_cycle_now(m_core->get_gpu()));
         m_response_fifo.pop_front();
       }
     } else if (mf->get_access_type() == CONST_ACC_R) {
       if (m_L1C->fill_port_free()) {
         mf->set_status(IN_SHADER_FETCHED,
-                       m_core->get_gpu()->gpu_sim_cycle +
-                           m_core->get_gpu()->gpu_tot_sim_cycle);
-        m_L1C->fill(mf, m_core->get_gpu()->gpu_sim_cycle +
-                            m_core->get_gpu()->gpu_tot_sim_cycle);
+                       shader_cycle_now(m_core->get_gpu()));
+        m_L1C->fill(mf, shader_cycle_now(m_core->get_gpu()));
         m_response_fifo.pop_front();
       }
     } else {
@@ -2933,15 +2993,13 @@ void ldst_unit::cycle() {
         if (bypassL1D) {
           if (m_next_global == NULL) {
             mf->set_status(IN_SHADER_FETCHED,
-                           m_core->get_gpu()->gpu_sim_cycle +
-                               m_core->get_gpu()->gpu_tot_sim_cycle);
+                           shader_cycle_now(m_core->get_gpu()));
             m_response_fifo.pop_front();
             m_next_global = mf;
           }
         } else {
           if (m_L1D->fill_port_free()) {
-            m_L1D->fill(mf, m_core->get_gpu()->gpu_sim_cycle +
-                                m_core->get_gpu()->gpu_tot_sim_cycle);
+            m_L1D->fill(mf, shader_cycle_now(m_core->get_gpu()));
             m_response_fifo.pop_front();
           }
         }
@@ -4735,24 +4793,8 @@ void sst_simt_core_cluster::icnt_inject_request_packet_to_SST(
 }
 
 void simt_core_cluster::icnt_cycle() {
-  if (!m_response_fifo.empty()) {
-    mem_fetch *mf = m_response_fifo.front();
-    unsigned cid = m_config->sid_to_cid(mf->get_sid());
-    if (mf->get_access_type() == INST_ACC_R) {
-      // instruction fetch response
-      if (!m_core[cid]->fetch_unit_response_buffer_full()) {
-        m_response_fifo.pop_front();
-        m_core[cid]->accept_fetch_response(mf);
-      }
-    } else {
-      // data response
-      if (!m_core[cid]->ldst_unit_response_buffer_full()) {
-        m_response_fifo.pop_front();
-        m_memory_stats->memlatstat_read_done(mf);
-        m_core[cid]->accept_ldst_unit_response(mf);
-      }
-    }
-  }
+  service_cluster_response_fifo(m_response_fifo, m_core, m_config,
+                                m_memory_stats);
   if (m_response_fifo.size() < m_config->n_simt_ejection_buffer_size) {
     mem_fetch *mf = (mem_fetch *)::icnt_pop(m_cluster_id);
     if (!mf) return;
@@ -4773,24 +4815,8 @@ void simt_core_cluster::icnt_cycle() {
 }
 
 void sst_simt_core_cluster::icnt_cycle_SST() {
-  if (!m_response_fifo.empty()) {
-    mem_fetch *mf = m_response_fifo.front();
-    unsigned cid = m_config->sid_to_cid(mf->get_sid());
-    if (mf->get_access_type() == INST_ACC_R) {
-      // instruction fetch response
-      if (!m_core[cid]->fetch_unit_response_buffer_full()) {
-        m_response_fifo.pop_front();
-        m_core[cid]->accept_fetch_response(mf);
-      }
-    } else {
-      // data response
-      if (!m_core[cid]->ldst_unit_response_buffer_full()) {
-        m_response_fifo.pop_front();
-        m_memory_stats->memlatstat_read_done(mf);
-        m_core[cid]->accept_ldst_unit_response(mf);
-      }
-    }
-  }
+  service_cluster_response_fifo(m_response_fifo, m_core, m_config,
+                                m_memory_stats);
 
   // pop from SST buffers
   if (m_response_fifo.size() < m_config->n_simt_ejection_buffer_size) {
@@ -4860,48 +4886,20 @@ void simt_core_cluster::get_cache_stats(cache_stats &cs) const {
 }
 
 void simt_core_cluster::get_L1I_sub_stats(struct cache_sub_stats &css) const {
-  struct cache_sub_stats temp_css;
-  struct cache_sub_stats total_css;
-  temp_css.clear();
-  total_css.clear();
-  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; ++i) {
-    m_core[i]->get_L1I_sub_stats(temp_css);
-    total_css += temp_css;
-  }
-  css = total_css;
+  aggregate_shader_sub_stats(m_core, m_config->n_simt_cores_per_cluster,
+                             &shader_core_ctx::get_L1I_sub_stats, css);
 }
 void simt_core_cluster::get_L1D_sub_stats(struct cache_sub_stats &css) const {
-  struct cache_sub_stats temp_css;
-  struct cache_sub_stats total_css;
-  temp_css.clear();
-  total_css.clear();
-  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; ++i) {
-    m_core[i]->get_L1D_sub_stats(temp_css);
-    total_css += temp_css;
-  }
-  css = total_css;
+  aggregate_shader_sub_stats(m_core, m_config->n_simt_cores_per_cluster,
+                             &shader_core_ctx::get_L1D_sub_stats, css);
 }
 void simt_core_cluster::get_L1C_sub_stats(struct cache_sub_stats &css) const {
-  struct cache_sub_stats temp_css;
-  struct cache_sub_stats total_css;
-  temp_css.clear();
-  total_css.clear();
-  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; ++i) {
-    m_core[i]->get_L1C_sub_stats(temp_css);
-    total_css += temp_css;
-  }
-  css = total_css;
+  aggregate_shader_sub_stats(m_core, m_config->n_simt_cores_per_cluster,
+                             &shader_core_ctx::get_L1C_sub_stats, css);
 }
 void simt_core_cluster::get_L1T_sub_stats(struct cache_sub_stats &css) const {
-  struct cache_sub_stats temp_css;
-  struct cache_sub_stats total_css;
-  temp_css.clear();
-  total_css.clear();
-  for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; ++i) {
-    m_core[i]->get_L1T_sub_stats(temp_css);
-    total_css += temp_css;
-  }
-  css = total_css;
+  aggregate_shader_sub_stats(m_core, m_config->n_simt_cores_per_cluster,
+                             &shader_core_ctx::get_L1T_sub_stats, css);
 }
 
 void exec_shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
